@@ -15,7 +15,7 @@ from decimal import Decimal
 
 import pytest
 
-from app import ledger
+from app import db as db_module, ledger
 
 
 def amounts(body):
@@ -543,3 +543,52 @@ def test_concurrent_same_key_release_replays_once(client):
     assert [b["replayed"] for b in bodies].count(True) == 1
     assert client.get("/wells/A1").json()["quarantine"] is None
     assert len(client.get("/quarantines/releases").json()["releases"]) == 1
+
+
+
+# -------------------------------- 谱系隔离与并发批次
+
+
+def test_lineage_closure_sees_batch_committed_while_waiting_for_lock(client, monkeypatch):
+    """谱系闭包在写锁内计算：取锁期间先提交的批次必被闭包看到。
+
+    谱系请求在 BEGIN IMMEDIATE **之前**等待；批次先持锁提交 A1->B1，
+    谱系请求取得锁后算出的闭包必须包含 B1。
+    """
+    register(client, "A1", "S1", "100")
+    lineage_ready = _Gate()   # 谱系请求已到达取锁前
+
+    # main 模块以 db_module.write_transaction 引用：patch db 模块属性即生效。
+    # 仅门闩谱系请求写事务的第一次调用（门闩已闭后，批次直接取锁不受影响）。
+    call_count = {"n": 0}
+    real_write = db_module.write_transaction
+
+    def once_write(conn):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            lineage_ready.entered.set()
+            assert lineage_ready.release.wait(10.0), "谱系请求未被放行取锁"
+        return real_write(conn)
+
+    monkeypatch.setattr(db_module, "write_transaction", once_write)
+
+    lineage_thread, lineage_result = _run_in_thread(
+        lambda: client.post(
+            "/quarantines/lineage",
+            json={"request_key": "lq-conc", "case_id": "CASE-1",
+                  "reason": "x", "seed_wells": ["A1"]},
+        )
+    )
+    lineage_ready.wait_inside()
+
+    # 谱系请求在取锁前等待期间，批次先提交 A1->B1
+    bid = committed_batch_id(client, "b-conc", "A1", "B1", "10")
+    assert bid
+
+    lineage_ready.release.set()
+    lineage_resp = _join(lineage_thread, lineage_result)
+
+    assert lineage_resp.status_code == 201, lineage_resp.text
+    wells = [w["well"] for w in lineage_resp.json()["wells"]]
+    # 取锁后读到的最新谱系已含 B1：不会漏掉先提交的边
+    assert wells == ["A1", "B1"]

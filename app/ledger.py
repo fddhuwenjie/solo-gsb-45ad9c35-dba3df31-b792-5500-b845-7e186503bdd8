@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import heapq
+import json
 from collections import namedtuple
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -892,6 +894,167 @@ def release_payload(conn: sqlite3.Connection, release_id: int, replayed: bool = 
         "replayed": replayed,
         "wells": [
             {"well": w["well"], "quarantine_id": w["request_id"]} for w in wells
+        ],
+    }
+
+
+# ---------------------------------------------------------------- 按移液谱系扩展隔离
+
+
+def committed_lineage_edges(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """已提交且未撤销批次的 source→destination 边构成的邻接表。
+
+    只取 committed 批次（failed 批次从未移液，不产生边）；已撤销批次的边
+    整体排除——撤销已把其液体移动恢复到批前快照，谱系传播不应再沿它扩散。
+    同批/跨批重复边去重，邻接目标按孔位标签升序，供字典序稳定遍历。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT o.source AS source, o.destination AS destination "
+        "FROM operations o "
+        "JOIN batches b ON b.id = o.batch_id "
+        "LEFT JOIN reversals rv ON rv.batch_id = b.id "
+        "WHERE b.status = 'committed' AND rv.batch_id IS NULL "
+        "ORDER BY o.source, o.destination"
+    ).fetchall()
+    adjacency: dict[str, list[str]] = {}
+    for row in rows:
+        adjacency.setdefault(row["source"], [])
+        if row["destination"] not in adjacency[row["source"]]:
+            adjacency[row["source"]].append(row["destination"])
+    return adjacency
+
+
+def compute_lineage_closure(
+    conn: sqlite3.Connection, seed_wells: list[str]
+) -> dict[str, dict]:
+    """沿已提交未撤销批次的边求种子孔的传递闭包与每孔移液路径。
+
+    返回 {well: {"path": [起点, ..., 该孔], "distance": int}}，含每个种子
+    自身（distance=0、路径仅含自身）。路径取边数最短者；同一最短长度下按
+    路径节点序列字典序取最小，因此结果对提交顺序无关、完全确定。图中的环
+    路只计一次（按孔去重，不重复访问、不重复隔离）。
+    """
+    adjacency = committed_lineage_edges(conn)
+    # 候选项为 (distance, path_tuple) 的最小堆：先比边数，再按整条路径
+    # 字典序比较，保证最短且字典序稳定；同一孔再次出堆时其距离不可能更小，
+    # 直接跳过即可。
+    best: dict[str, tuple[int, tuple[str, ...]]] = {}
+    heap: list[tuple[int, tuple[str, ...]]] = []
+    for seed in dict.fromkeys(seed_wells):
+        heapq.heappush(heap, (0, (seed,)))
+    while heap:
+        distance, path = heapq.heappop(heap)
+        well = path[-1]
+        previous = best.get(well)
+        if previous is not None and previous <= (distance, path):
+            continue
+        best[well] = (distance, path)
+        for nxt in adjacency.get(well, []):
+            if nxt in path:
+                # 回到当前路径上的孔只形成环，不产生更短路径，也避免无限循环。
+                continue
+            heapq.heappush(heap, (distance + 1, path + (nxt,)))
+    return {
+        well: {"path": list(path), "distance": distance}
+        for well, (distance, path) in sorted(best.items())
+    }
+
+
+def lineage_seed_wells(conn: sqlite3.Connection, request_id: int) -> list[str]:
+    return [
+        r["well"]
+        for r in conn.execute(
+            "SELECT well FROM quarantine_lineage_seeds WHERE request_id = ? ORDER BY well",
+            (request_id,),
+        ).fetchall()
+    ]
+
+
+def apply_lineage_quarantine(
+    conn: sqlite3.Connection,
+    request_key: str,
+    case_id: str,
+    reason: str,
+    seed_wells: list[str],
+) -> tuple[int, dict[str, dict]]:
+    """在调用方写事务内：计算谱系闭包、逐孔校验、原子建立隔离。
+
+    闭包内任一孔未登记（WellNotFound）、已处于隔离状态（QuarantineConflict）
+    或存在生效预留（ReservationsBlockQuarantine）即抛出，由调用方回滚：
+    整次申请不留部分状态、不消耗 request_key——与普通隔离申请完全同一套
+    拒绝规则，只是目标孔集合由种子沿谱系扩展得到。
+    """
+    closure = compute_lineage_closure(conn, seed_wells)
+    wells = list(closure)
+    for well in wells:
+        if get_well_volume(conn, well) is None:
+            raise WellNotFound(well)
+    active = _active_quarantine_map(conn, wells)
+    if active:
+        raise QuarantineConflict([active[w] for w in wells if w in active])
+    blocked = active_reservation_blockers(conn, wells)
+    if blocked:
+        raise ReservationsBlockQuarantine(blocked)
+    cur = conn.execute(
+        "INSERT INTO quarantine_requests (request_key, case_id, reason, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (request_key, case_id, reason, _now()),
+    )
+    request_id = int(cur.lastrowid)
+    conn.executemany(
+        "INSERT INTO quarantine_wells (request_id, well) VALUES (?, ?)",
+        [(request_id, well) for well in wells],
+    )
+    # 多种子时每孔一行（seed_wells 已排序去重）。
+    conn.executemany(
+        "INSERT INTO quarantine_lineage_seeds (request_id, well) VALUES (?, ?)",
+        [(request_id, well) for well in seed_wells],
+    )
+    conn.executemany(
+        "INSERT INTO quarantine_lineage_wells (request_id, well, distance, path) "
+        "VALUES (?, ?, ?, ?)",
+        [
+            (request_id, well, entry["distance"], json.dumps(entry["path"], ensure_ascii=False))
+            for well, entry in closure.items()
+        ],
+    )
+    return request_id, closure
+
+
+def lineage_quarantine_payload(
+    conn: sqlite3.Connection, request_id: int, replayed: bool = False
+) -> dict:
+    row = conn.execute(
+        "SELECT * FROM quarantine_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    rows = conn.execute(
+        "SELECT well, distance, path FROM quarantine_lineage_wells "
+        "WHERE request_id = ? ORDER BY well",
+        (request_id,),
+    ).fetchall()
+    status_rows = conn.execute(
+        "SELECT well, released_at FROM quarantine_wells WHERE request_id = ?",
+        (request_id,),
+    ).fetchall()
+    released_at = {r["well"]: r["released_at"] for r in status_rows}
+    return {
+        "quarantine_id": row["id"],
+        "request_key": row["request_key"],
+        "case_id": row["case_id"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+        "replayed": replayed,
+        "propagation": "pipetting_lineage",
+        "seed_wells": lineage_seed_wells(conn, request_id),
+        "wells": [
+            {
+                "well": r["well"],
+                "status": "released" if released_at[r["well"]] is not None else "quarantined",
+                "released_at": released_at[r["well"]],
+                "distance": r["distance"],
+                "path": json.loads(r["path"]),
+            }
+            for r in rows
         ],
     }
 

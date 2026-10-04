@@ -135,6 +135,30 @@ CREATE TABLE IF NOT EXISTS quarantine_release_wells (
     PRIMARY KEY (release_id, well)
 );
 
+-- 按移液谱系扩展的隔离申请：复用 quarantine_requests 主记录（同一申请号即
+-- 同一条隔离，后续移液/补液/容量/预留/计划/撤销的隔离限制全部沿用），
+-- 这两张表额外记录种子孔与沿已提交未撤销批次 source→destination 边计算出
+-- 的传递闭包（每孔一行，含距离与最短且字典序稳定的移液路径），用于
+-- 同键重放与按孔返回路径。
+CREATE TABLE IF NOT EXISTS quarantine_lineage_seeds (
+    request_id INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    well       TEXT NOT NULL,
+    PRIMARY KEY (request_id, well)
+);
+
+CREATE TABLE IF NOT EXISTS quarantine_lineage_wells (
+    request_id INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    well       TEXT NOT NULL,
+    distance   INTEGER NOT NULL,
+    -- 从种子孔到该孔的移液路径（含起终点），JSON TEXT 存储；
+    -- distance=0 时路径仅含种子孔自身。
+    path       TEXT NOT NULL,
+    PRIMARY KEY (request_id, well)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_lineage_wells
+    ON quarantine_lineage_wells(request_id, well);
+
 -- 移液体积预留：操作员用 request_key 为未来批次一次预留多个已登记来源孔的
 -- Decimal 体积。同一事务扣除各孔其他生效预留后检查可用量，任一不足、孔已
 -- 隔离或同一孔重复即整次失败，不留部分预留。

@@ -180,6 +180,42 @@ class QuarantineReleaseCreate(_QuarantineWellsMixin):
         return value
 
 
+class _LineageSeedMixin(BaseModel):
+    """谱系隔离的种子孔：逐孔校验标签，排序去重得到种子的统一形式。"""
+
+    seed_wells: list[str] = Field(min_length=1)
+
+    @field_validator("seed_wells")
+    @classmethod
+    def _seed_wells(cls, value: list[str]) -> list[str]:
+        return [normalize_well(w) for w in value]
+
+    @model_validator(mode="after")
+    def _dedupe_seeds(self):
+        self.seed_wells = sorted(set(self.seed_wells))
+        return self
+
+
+class LineageQuarantineCreate(_LineageSeedMixin):
+    """按移液谱系扩展的隔离申请：种子孔 + 案件号 + 原因；request_key 幂等。
+
+    服务在同一写事务内沿已提交且未撤销批次的 source→destination 边计算
+    传递闭包，把种子及所有后代孔作为一次隔离申请。
+    """
+
+    request_key: str = Field(min_length=1, max_length=128)
+    case_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("request_key", "case_id", "reason")
+    @classmethod
+    def _text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+
 # ---------------------------------------------------------------- 移液体积预留
 
 
