@@ -135,6 +135,30 @@ CREATE TABLE IF NOT EXISTS quarantine_release_wells (
     PRIMARY KEY (release_id, well)
 );
 
+-- 谱系隔离：在普通隔离申请（quarantine_requests/quarantine_wells 照常写入，
+-- 全部既有隔离限制自动生效）之上记录种子孔与逐孔最短路径，用于审计与
+-- 「同键同种子同案件」重放判定。闭包沿「已提交且未撤销」批次的
+-- source→destination 边在申请时的写事务内计算并随申请落库：重放返回
+-- 首次结果，不随后续图谱变化重算。
+CREATE TABLE IF NOT EXISTS quarantine_lineage_seeds (
+    request_id INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    seed       TEXT NOT NULL,
+    PRIMARY KEY (request_id, seed)
+);
+
+-- 闭包内每个孔的最短移液路径：path 为从某种子到该孔的孔位序列（JSON 数组，
+-- 同等最短时取孔位序列字典序最小者），hops 为对应的逐跳批次明细
+-- （JSON 数组，含 batch_id/step/source/destination/volume；同一对孔之间
+-- 取 (batch_id, step) 最小的边）。
+CREATE TABLE IF NOT EXISTS quarantine_lineage_paths (
+    request_id INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    well       TEXT NOT NULL,
+    distance   INTEGER NOT NULL,
+    path       TEXT NOT NULL,
+    hops       TEXT NOT NULL,
+    PRIMARY KEY (request_id, well)
+);
+
 -- 移液体积预留：操作员用 request_key 为未来批次一次预留多个已登记来源孔的
 -- Decimal 体积。同一事务扣除各孔其他生效预留后检查可用量，任一不足、孔已
 -- 隔离或同一孔重复即整次失败，不留部分预留。

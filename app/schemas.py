@@ -180,6 +180,38 @@ class QuarantineReleaseCreate(_QuarantineWellsMixin):
         return value
 
 
+class LineageQuarantineCreate(BaseModel):
+    """谱系隔离申请：种子孔 + 案件号 + 原因；request_key 用于幂等去重。
+
+    服务沿已提交且未撤销批次的 source→destination 边计算传递闭包，把种子及
+    所有后代孔作为一次隔离申请；排序去重后的种子集合与案件号共同构成
+    「同键同目标」的判定依据。
+    """
+
+    request_key: str = Field(min_length=1, max_length=128)
+    case_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=500)
+    seeds: list[str] = Field(min_length=1)
+
+    @field_validator("request_key", "case_id", "reason")
+    @classmethod
+    def _text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+    @field_validator("seeds")
+    @classmethod
+    def _seeds(cls, value: list[str]) -> list[str]:
+        return [normalize_well(w) for w in value]
+
+    @model_validator(mode="after")
+    def _dedupe_seeds(self) -> "LineageQuarantineCreate":
+        self.seeds = sorted(set(self.seeds))
+        return self
+
+
 # ---------------------------------------------------------------- 移液体积预留
 
 

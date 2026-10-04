@@ -13,6 +13,7 @@ from . import ledger
 from .schemas import (
     BatchCreate,
     CapacityUpdate,
+    LineageQuarantineCreate,
     PlanConfirmCreate,
     PlanCreate,
     QuarantineCreate,
@@ -908,6 +909,112 @@ def list_quarantine_releases(conn: sqlite3.Connection = Depends(get_db)) -> dict
     """全部解除隔离审计记录。"""
     rows = conn.execute("SELECT id FROM quarantine_releases ORDER BY id").fetchall()
     return {"releases": [ledger.release_payload(conn, row["id"]) for row in rows]}
+
+
+# ---------------------------------------------------------------- 谱系隔离
+
+def _lineage_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: LineageQuarantineCreate,
+    response: Response,
+) -> dict:
+    """同键同目标（案件 + 排序去重后的种子集合）按重放返回首次结果；同键换目标 409。"""
+    case_id = row["case_id"]
+    seeds = ledger.lineage_seeds(conn, int(row["id"]))
+    if seeds is not None and case_id == payload.case_id and seeds == payload.seeds:
+        response.status_code = 200
+        return ledger.lineage_payload(conn, int(row["id"]), replayed=True)
+    detail: dict = {"reason": "request_key_conflict", "existing_case_id": case_id}
+    if seeds is not None:
+        detail["existing_seeds"] = seeds
+        detail["message"] = (
+            f"request_key {payload.request_key} 已用于案件 {case_id} 对种子孔 "
+            f"{'、'.join(seeds)} 的谱系隔离申请，不能再用于案件 "
+            f"{payload.case_id} 对 {'、'.join(payload.seeds)} 的申请"
+        )
+    else:
+        # 键被普通隔离申请占用：同样视为换目标冲突
+        wells = [
+            r["well"]
+            for r in conn.execute(
+                "SELECT well FROM quarantine_wells WHERE request_id = ? ORDER BY well",
+                (row["id"],),
+            ).fetchall()
+        ]
+        detail["existing_wells"] = wells
+        detail["message"] = (
+            f"request_key {payload.request_key} 已用于案件 {case_id} 对孔位 "
+            f"{'、'.join(wells)} 的普通隔离申请，不能再用于谱系隔离申请"
+        )
+    raise HTTPException(status_code=409, detail=detail)
+
+
+@app.post("/quarantines/lineage")
+def create_lineage_quarantine(
+    payload: LineageQuarantineCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """谱系隔离申请：沿移液谱系把种子及所有后代孔作为一次隔离申请。
+
+    在同一写事务内沿已提交且未撤销批次的 source→destination 边计算传递闭包
+    （循环只计一次），按孔返回最短且字典序稳定的移液路径；任一目标未登记
+    （404）、已隔离（409 already_quarantined）或存在生效预留
+    （409 reservations_active）即整次拒绝，不留部分状态、不消耗 request_key。
+    建立后与普通隔离同权：补液、批次、容量变更、预留、计划确认与撤销均沿用
+    隔离限制，解除走同一 /quarantines/releases 端点。
+    request_key 幂等：同键同种子同案件返回首次结果（200），同键换目标 409。
+    """
+    # 事务外快速路径：无并发时直接给出重放/换目标结论，免取写锁。
+    existing = ledger.find_quarantine_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _lineage_replay_or_conflict(conn, existing, payload, response)
+
+    try:
+        # BEGIN IMMEDIATE 立即取锁：幂等复核、闭包计算、校验与写入持同一把锁
+        # 完成，与并发补液/批次/撤销/容量变更/预留/其他隔离申请串行——闭包
+        # 看到的是锁内已提交的最新图谱。
+        with db_module.write_transaction(conn):
+            row = ledger.find_quarantine_by_key(conn, payload.request_key)
+            if row is not None:
+                return _lineage_replay_or_conflict(conn, row, payload, response)
+            quarantine_id = ledger.apply_lineage_quarantine(
+                conn, payload.request_key, payload.case_id, payload.reason, payload.seeds
+            )
+    except ledger.WellNotFound as exc:
+        raise HTTPException(status_code=404, detail=f"孔位 {exc.well} 尚未登记，不能隔离")
+    except ledger.QuarantineConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "already_quarantined",
+                "conflicting_wells": exc.conflicts,
+            },
+        )
+    except ledger.ReservationsBlockQuarantine as exc:
+        # 目标孔上存在生效预留：整次隔离拒绝，逐孔列出阻塞预留，不消耗 request_key
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservations_active",
+                "blocking_wells": exc.blockers,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
+        row = ledger.find_quarantine_by_key(conn, payload.request_key)
+        if row is not None:
+            return _lineage_replay_or_conflict(conn, row, payload, response)
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "隔离申请与现有隔离冲突", "reason": "already_quarantined"},
+        )
+
+    response.status_code = 201
+    return ledger.lineage_payload(conn, quarantine_id)
 
 
 # ---------------------------------------------------------------- 移液体积预留

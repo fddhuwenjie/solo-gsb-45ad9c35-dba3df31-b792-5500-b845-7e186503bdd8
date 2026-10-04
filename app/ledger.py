@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections import namedtuple
 from copy import deepcopy
@@ -894,6 +895,147 @@ def release_payload(conn: sqlite3.Connection, release_id: int, replayed: bool = 
             {"well": w["well"], "quarantine_id": w["request_id"]} for w in wells
         ],
     }
+
+
+# ---------------------------------------------------------------- 谱系隔离
+
+def _live_transfer_edges(conn: sqlite3.Connection) -> dict[str, dict[str, list]]:
+    """已提交且未撤销批次的 source→destination 边（撤销批次的谱系视为已回滚）。
+
+    返回 source -> destination -> 该孔对之间按 (batch_id, step) 升序的边列表；
+    同一对孔之间取首条作为路径的规范边，保证逐跳明细确定。
+    """
+    rows = conn.execute(
+        "SELECT o.source AS source, o.destination AS destination, "
+        "       o.batch_id AS batch_id, o.step AS step, o.volume AS volume "
+        "FROM operations o JOIN batches b ON b.id = o.batch_id "
+        "WHERE b.status = 'committed' "
+        "  AND NOT EXISTS (SELECT 1 FROM reversals r WHERE r.batch_id = b.id) "
+        "ORDER BY o.source, o.destination, o.batch_id, o.step"
+    ).fetchall()
+    edges: dict[str, dict[str, list]] = {}
+    for row in rows:
+        edges.setdefault(row["source"], {}).setdefault(row["destination"], []).append(row)
+    return edges
+
+
+def lineage_closure(conn: sqlite3.Connection, seeds: list[str]) -> dict[str, dict]:
+    """从种子孔沿 live 边求传递闭包：种子及所有后代孔（循环只计一次）。
+
+    每个孔记录最短且字典序稳定的移液路径：BFS 逐层展开保证跳数最短；同层
+    多个前驱时取「前驱路径 + 本孔」孔位序列字典序最小者；同一对孔之间取
+    (batch_id, step) 最小的边作为逐跳明细。返回
+    well -> {"distance", "path", "hops"}，种子 distance 为 0、path 为自身。
+    """
+    edges = _live_transfer_edges(conn)
+    best: dict[str, dict] = {
+        seed: {"distance": 0, "path": [seed], "hops": []} for seed in seeds
+    }
+    frontier = list(seeds)
+    while frontier:
+        # 本层候选：dst -> (孔位序列, 逐跳明细)；同一 dst 取字典序最小序列
+        candidates: dict[str, tuple[tuple[str, ...], list[dict]]] = {}
+        for well in frontier:
+            info = best[well]
+            for dst, edge_list in edges.get(well, {}).items():
+                if dst in best:
+                    continue  # 已有不更长的路径（含成环回到已访问孔）：只计一次
+                edge = edge_list[0]
+                path = (*info["path"], dst)
+                hops = info["hops"] + [
+                    {
+                        "batch_id": int(edge["batch_id"]),
+                        "step": int(edge["step"]),
+                        "source": edge["source"],
+                        "destination": edge["destination"],
+                        "volume": edge["volume"],
+                    }
+                ]
+                current = candidates.get(dst)
+                if current is None or path < current[0]:
+                    candidates[dst] = (path, hops)
+        if not candidates:
+            break
+        for dst, (path, hops) in candidates.items():
+            best[dst] = {"distance": len(path) - 1, "path": list(path), "hops": hops}
+        frontier = sorted(candidates)
+    return best
+
+
+def apply_lineage_quarantine(
+    conn: sqlite3.Connection,
+    request_key: str,
+    case_id: str,
+    reason: str,
+    seeds: list[str],
+) -> int:
+    """在调用方写事务内计算谱系闭包并原子建立隔离记录。
+
+    闭包 = 种子 + 沿已提交且未撤销批次 source→destination 边的全部后代孔；
+    校验与写入复用普通隔离（任一目标未登记/已隔离/存在生效预留即抛出，由
+    调用方回滚，整次申请不留部分状态、不消耗 request_key）。闭包与逐孔
+    最短路径随申请落库：重放返回首次结果，不随后续图谱变化重算。
+    """
+    closure = lineage_closure(conn, seeds)
+    wells = sorted(closure)
+    request_id = apply_quarantine(conn, request_key, case_id, reason, wells)
+    conn.executemany(
+        "INSERT INTO quarantine_lineage_seeds (request_id, seed) VALUES (?, ?)",
+        [(request_id, seed) for seed in seeds],
+    )
+    conn.executemany(
+        "INSERT INTO quarantine_lineage_paths (request_id, well, distance, path, hops) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                request_id,
+                well,
+                closure[well]["distance"],
+                json.dumps(closure[well]["path"]),
+                json.dumps(closure[well]["hops"]),
+            )
+            for well in wells
+        ],
+    )
+    return request_id
+
+
+def lineage_seeds(conn: sqlite3.Connection, request_id: int) -> list[str] | None:
+    """该隔离申请的谱系种子（排序）；普通隔离申请返回 None。"""
+    rows = conn.execute(
+        "SELECT seed FROM quarantine_lineage_seeds WHERE request_id = ? ORDER BY seed",
+        (request_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    return [row["seed"] for row in rows]
+
+
+def lineage_payload(
+    conn: sqlite3.Connection, request_id: int, replayed: bool = False
+) -> dict:
+    """谱系隔离申请载荷：普通隔离字段 + 种子集合与逐孔最短移液路径。"""
+    base = quarantine_payload(conn, request_id, replayed=replayed)
+    paths = {
+        row["well"]: row
+        for row in conn.execute(
+            "SELECT well, distance, path, hops FROM quarantine_lineage_paths "
+            "WHERE request_id = ?",
+            (request_id,),
+        ).fetchall()
+    }
+    wells = []
+    for item in base["wells"]:
+        stored = paths[item["well"]]
+        wells.append(
+            {
+                **item,
+                "distance": stored["distance"],
+                "path": json.loads(stored["path"]),
+                "hops": json.loads(stored["hops"]),
+            }
+        )
+    return {**base, "seeds": lineage_seeds(conn, request_id), "wells": wells}
 
 
 # ---------------------------------------------------------------- 移液体积预留
